@@ -16,6 +16,7 @@ import { logger } from "@/lib/logger";
 import { createProxyAgentForProvider } from "@/lib/proxy-agent";
 import { SessionManager } from "@/lib/session-manager";
 import { CONTEXT_1M_BETA_HEADER, shouldApplyContext1m } from "@/lib/special-attributes";
+import { recordStickyFailure, recordStickySuccess } from "@/lib/sticky-provider";
 import type { CacheTtlPreference, CacheTtlResolved } from "@/types/cache";
 import { isOfficialCodexClient, sanitizeCodexRequest } from "../codex/utils/request-sanitizer";
 import { defaultRegistry } from "../converters";
@@ -302,6 +303,18 @@ export class ProxyForwarder {
           // ========== 成功分支 ==========
           recordSuccess(currentProvider.id);
 
+          // ⭐ 记录粘性成功（重置连续失败计数）
+          const effectiveGroup =
+            session.authState?.key?.providerGroup ||
+            session.authState?.user?.providerGroup ||
+            null;
+          recordStickySuccess(
+            effectiveGroup,
+            currentProvider.priority || 0,
+            currentProvider.providerType,
+            currentProvider.id
+          );
+
           // ⭐ 成功后绑定 session 到供应商（智能绑定策略）
           if (session.sessionId) {
             // 使用智能绑定策略（故障转移优先 + 稳定性优化）
@@ -522,6 +535,18 @@ export class ProxyForwarder {
             const env = getEnvConfig();
 
             // 无论是否计入熔断器，都要加入 failedProviderIds（避免重复选择同一供应商）
+            // ⭐ 记录粘性失败（系统错误也计入）
+            const systemEffectiveGroup =
+              session.authState?.key?.providerGroup ||
+              session.authState?.user?.providerGroup ||
+              null;
+            recordStickyFailure(
+              systemEffectiveGroup,
+              currentProvider.priority || 0,
+              currentProvider.providerType,
+              currentProvider.id
+            );
+
             failedProviderIds.push(currentProvider.id);
 
             if (env.ENABLE_CIRCUIT_BREAKER_ON_NETWORK_ERRORS) {
@@ -593,6 +618,18 @@ export class ProxyForwarder {
               continue;
             }
 
+            // ⭐ 记录粘性失败（404 也计入）
+            const notFoundEffectiveGroup =
+              session.authState?.key?.providerGroup ||
+              session.authState?.user?.providerGroup ||
+              null;
+            recordStickyFailure(
+              notFoundEffectiveGroup,
+              currentProvider.priority || 0,
+              currentProvider.providerType,
+              currentProvider.id
+            );
+
             // 重试耗尽：加入失败列表并切换供应商
             failedProviderIds.push(currentProvider.id);
             break; // ⭐ 跳出内层循环，进入供应商切换逻辑
@@ -648,6 +685,18 @@ export class ProxyForwarder {
               if (!session.isProbeRequest()) {
                 await recordFailure(currentProvider.id, lastError);
               }
+
+              // ⭐ 记录粘性失败
+              const emptyEffectiveGroup =
+                session.authState?.key?.providerGroup ||
+                session.authState?.user?.providerGroup ||
+                null;
+              recordStickyFailure(
+                emptyEffectiveGroup,
+                currentProvider.priority || 0,
+                currentProvider.providerType,
+                currentProvider.id
+              );
 
               failedProviderIds.push(currentProvider.id);
               break; // 跳出内层循环，进入供应商切换逻辑
@@ -724,6 +773,18 @@ export class ProxyForwarder {
             } else {
               await recordFailure(currentProvider.id, lastError);
             }
+
+            // ⭐ 记录粘性失败
+            const providerEffectiveGroup =
+              session.authState?.key?.providerGroup ||
+              session.authState?.user?.providerGroup ||
+              null;
+            recordStickyFailure(
+              providerEffectiveGroup,
+              currentProvider.priority || 0,
+              currentProvider.providerType,
+              currentProvider.id
+            );
 
             // 加入失败列表并切换供应商
             failedProviderIds.push(currentProvider.id);

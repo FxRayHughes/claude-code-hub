@@ -3,6 +3,11 @@ import { PROVIDER_GROUP } from "@/lib/constants/provider.constants";
 import { logger } from "@/lib/logger";
 import { RateLimitService } from "@/lib/rate-limit";
 import { SessionManager } from "@/lib/session-manager";
+import {
+  getExcludedProviders,
+  getStickyProvider,
+  setStickyProvider,
+} from "@/lib/sticky-provider";
 import { findAllProviders, findProviderById } from "@/repository/provider";
 import { getSystemSettings } from "@/repository/system-config";
 import type { ProviderChainItem } from "@/types/message";
@@ -851,7 +856,7 @@ export class ProxyProviderResolver {
     context.priorityLevels = priorities;
     context.selectedPriority = Math.min(...healthyProviders.map((p) => p.priority || 0));
 
-    // Step 6: 成本排序 + 加权选择 + 计算概率
+    // Step 6: 粘性选择 + 成本排序 + 加权选择
     const totalWeight = topPriorityProviders.reduce((sum, p) => sum + p.weight, 0);
     context.candidatesAtPriority = topPriorityProviders.map((p) => ({
       id: p.id,
@@ -861,7 +866,98 @@ export class ProxyProviderResolver {
       probability: totalWeight > 0 ? Math.round((p.weight / totalWeight) * 100) : 0,
     }));
 
-    const selected = ProxyProviderResolver.selectOptimal(topPriorityProviders);
+    // Step 6a: 检查是否有粘性供应商可用
+    const effectiveGroup = getEffectiveProviderGroup(session);
+    const stickyProviderId = getStickyProvider(
+      effectiveGroup,
+      context.selectedPriority,
+      targetType,
+      topPriorityProviders.map((p) => p.id)
+    );
+
+    let selected: Provider;
+    let selectionMethod: "sticky" | "weighted_random" = "weighted_random";
+
+    if (stickyProviderId) {
+      // 检查粘性供应商是否在排除列表中（失败过多被排除）
+      const stickyExcluded = getExcludedProviders(
+        effectiveGroup,
+        context.selectedPriority,
+        targetType
+      );
+      const stickyProvider = topPriorityProviders.find((p) => p.id === stickyProviderId);
+
+      if (stickyProvider && !stickyExcluded.includes(stickyProviderId)) {
+        // 使用粘性供应商
+        selected = stickyProvider;
+        selectionMethod = "sticky";
+        logger.debug("ProviderSelector: Using sticky provider", {
+          providerId: stickyProviderId,
+          providerName: stickyProvider.name,
+          priority: context.selectedPriority,
+          group: effectiveGroup,
+        });
+      } else {
+        // 粘性供应商被排除，需要在剩余候选中选择新的
+        const availableCandidates = topPriorityProviders.filter(
+          (p) => !stickyExcluded.includes(p.id)
+        );
+
+        if (availableCandidates.length > 0) {
+          selected = ProxyProviderResolver.selectOptimal(availableCandidates);
+          // 设置新的粘性供应商
+          setStickyProvider(effectiveGroup, context.selectedPriority, targetType, selected.id);
+          logger.info("ProviderSelector: Switched to new sticky provider (previous excluded)", {
+            previousId: stickyProviderId,
+            newId: selected.id,
+            newName: selected.name,
+            excludedIds: stickyExcluded,
+          });
+        } else {
+          // 同优先级所有供应商都被排除，需要降级到下一优先级
+          // 这种情况下返回 null，让调用方处理降级逻辑
+          logger.warn(
+            "ProviderSelector: All providers at priority level excluded, may need fallback",
+            {
+              priority: context.selectedPriority,
+              excludedIds: stickyExcluded,
+              totalCandidates: topPriorityProviders.length,
+            }
+          );
+          // 尝试从其他优先级选择
+          const otherPriorityProviders = healthyProviders.filter(
+            (p) => (p.priority || 0) !== context.selectedPriority
+          );
+          if (otherPriorityProviders.length > 0) {
+            const nextPriorityProviders =
+              ProxyProviderResolver.selectTopPriority(otherPriorityProviders);
+            selected = ProxyProviderResolver.selectOptimal(nextPriorityProviders);
+            const newPriority = selected.priority || 0;
+            setStickyProvider(effectiveGroup, newPriority, targetType, selected.id);
+            context.selectedPriority = newPriority;
+            logger.info("ProviderSelector: Fallback to next priority level", {
+              previousPriority: Math.min(...topPriorityProviders.map((p) => p.priority || 0)),
+              newPriority,
+              selectedId: selected.id,
+              selectedName: selected.name,
+            });
+          } else {
+            // 完全没有可用供应商
+            return { provider: null, context };
+          }
+        }
+      }
+    } else {
+      // 没有粘性供应商，随机选择一个并设置为粘性
+      selected = ProxyProviderResolver.selectOptimal(topPriorityProviders);
+      setStickyProvider(effectiveGroup, context.selectedPriority, targetType, selected.id);
+      logger.info("ProviderSelector: Set initial sticky provider", {
+        providerId: selected.id,
+        providerName: selected.name,
+        priority: context.selectedPriority,
+        group: effectiveGroup,
+      });
+    }
 
     // 详细的选择日志
     logger.info("ProviderSelector: Selection decision", {
